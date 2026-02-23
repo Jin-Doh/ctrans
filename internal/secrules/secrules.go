@@ -7,7 +7,7 @@ import (
 
 const (
 	DefaultSensitiveKeyPatternExpr  = `(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`
-	DefaultSensitivePathPatternExpr = `(?i)(^|/)(id_rsa|id_ed25519|.*\\.pem|.*\\.key)$`
+	DefaultSensitivePathPatternExpr = `(?i)(^|/)(id_rsa|id_ed25519|.*\.pem|.*\.key)$`
 )
 
 // CompilePattern compiles user-provided regex patterns with fallback.

@@ -42,6 +42,26 @@ func TestScan_SensitiveEnvAndVolume(t *testing.T) {
 	}
 }
 
+func TestScan_SensitivePemAndKeyVolumePathByDefaultPattern(t *testing.T) {
+	project := compose.NewProject()
+	project.Files = []string{"compose.yaml"}
+	project.Services["pem"] = &compose.Service{
+		Name:    "pem",
+		Image:   "alpine",
+		Volumes: []string{"/tmp/client.pem:/run/client.pem:ro"},
+	}
+	project.Services["key"] = &compose.Service{
+		Name:    "key",
+		Image:   "alpine",
+		Volumes: []string{"/tmp/server.key:/run/server.key:ro"},
+	}
+
+	rep := Scan(project, nil, Config{Mask: true})
+	if rep.Summary.Error < 2 {
+		t.Fatalf("expected .pem/.key volume paths detected as errors, got %+v", rep)
+	}
+}
+
 func TestPromoteWarningsToErrors(t *testing.T) {
 	findings := []report.Finding{{ID: "x", Severity: report.SeverityWarn}}
 	promoted := PromoteWarningsToErrors(findings)
