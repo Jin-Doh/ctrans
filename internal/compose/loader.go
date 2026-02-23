@@ -39,9 +39,24 @@ var (
 	}
 )
 
+// ResolveOptions controls default compose file discovery behavior.
+type ResolveOptions struct {
+	DefaultCandidates []string
+}
+
+// LoadOptions controls compose loading behavior.
+type LoadOptions struct {
+	Resolve ResolveOptions
+}
+
 // Load reads compose files and merges them in order.
 func Load(inputFiles []string, cwd string) (*Project, []report.Finding, error) {
-	files, warnings, err := ResolveInputFiles(inputFiles, cwd)
+	return LoadWithOptions(inputFiles, cwd, LoadOptions{})
+}
+
+// LoadWithOptions reads compose files and merges them in order.
+func LoadWithOptions(inputFiles []string, cwd string, opts LoadOptions) (*Project, []report.Finding, error) {
+	files, warnings, err := ResolveInputFilesWithOptions(inputFiles, cwd, opts.Resolve)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,6 +79,11 @@ func Load(inputFiles []string, cwd string) (*Project, []report.Finding, error) {
 
 // ResolveInputFiles returns input files following repeatable -f and default lookup rules.
 func ResolveInputFiles(inputFiles []string, cwd string) ([]string, []report.Finding, error) {
+	return ResolveInputFilesWithOptions(inputFiles, cwd, ResolveOptions{})
+}
+
+// ResolveInputFilesWithOptions returns input files following repeatable -f and default lookup rules.
+func ResolveInputFilesWithOptions(inputFiles []string, cwd string, opts ResolveOptions) ([]string, []report.Finding, error) {
 	if cwd == "" {
 		cwd = "."
 	}
@@ -99,8 +119,13 @@ func ResolveInputFiles(inputFiles []string, cwd string) ([]string, []report.Find
 		return resolved, warnings, nil
 	}
 
+	candidates := opts.DefaultCandidates
+	if len(candidates) == 0 {
+		candidates = defaultComposeCandidates
+	}
+
 	existing := []string{}
-	for _, candidate := range defaultComposeCandidates {
+	for _, candidate := range candidates {
 		full := filepath.Join(cwd, candidate)
 		if _, err := os.Stat(full); err == nil {
 			existing = append(existing, full)
@@ -109,18 +134,19 @@ func ResolveInputFiles(inputFiles []string, cwd string) ([]string, []report.Find
 
 	switch len(existing) {
 	case 0:
-		return nil, warnings, fmt.Errorf("compose 파일이 지정되지 않았고 기본 파일도 없습니다 (docker-compose.yaml, compose.yaml)")
+		return nil, warnings, fmt.Errorf("compose 파일이 지정되지 않았고 기본 파일도 없습니다 (%s)", strings.Join(candidates, ", "))
 	case 1:
 		return existing, warnings, nil
 	default:
+		preferred := existing[0]
 		warnings = append(warnings, report.Finding{
 			ID:             "default-compose-collision",
 			Severity:       report.SeverityWarn,
 			Field:          "file",
-			Message:        "docker-compose.yaml 과 compose.yaml 이 모두 존재하여 docker-compose.yaml 을 우선 사용합니다",
-			Recommendation: "compose.yaml 을 정리하거나 -f 순서를 명시해서 병합 순서를 제어하세요",
+			Message:        fmt.Sprintf("%s 파일들이 모두 존재하여 첫 번째 발견 후보(%s)를 우선 사용합니다", strings.Join(candidates, ", "), filepath.Base(preferred)),
+			Recommendation: "중복 후보 파일을 정리하거나 -f 순서를 명시해서 병합 순서를 제어하세요",
 		})
-		return []string{filepath.Join(cwd, "docker-compose.yaml")}, warnings, nil
+		return []string{preferred}, warnings, nil
 	}
 }
 

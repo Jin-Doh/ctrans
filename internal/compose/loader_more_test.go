@@ -144,3 +144,39 @@ func TestParseFile_ReadError(t *testing.T) {
 		t.Fatalf("expected read error")
 	}
 }
+
+func TestResolveInputFilesWithOptions_DefaultCandidates(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "custom-compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	files, warnings, err := ResolveInputFilesWithOptions(nil, dir, ResolveOptions{
+		DefaultCandidates: []string{"custom-compose.yaml", "compose.yaml"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveInputFilesWithOptions returned error: %v", err)
+	}
+	if len(files) != 1 || filepath.Base(files[0]) != "custom-compose.yaml" {
+		t.Fatalf("expected custom-compose.yaml, got %v", files)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %+v", warnings)
+	}
+}
+
+func TestLoadWithOptions_UsesCustomDefaults(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "custom.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	project, warnings, err := LoadWithOptions(nil, dir, LoadOptions{
+		Resolve: ResolveOptions{DefaultCandidates: []string{"custom.yaml"}},
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOptions returned error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %+v", warnings)
+	}
+	if _, ok := project.Services["app"]; !ok {
+		t.Fatalf("expected app service loaded from custom default candidates")
+	}
+}
