@@ -1,0 +1,8 @@
+services:
+  app:
+    image: nginx:stable
+    environment:
+      APP_ENV: prod
+      FEATURE_FLAG: enabled
+    ports:
+      - "8081:80"

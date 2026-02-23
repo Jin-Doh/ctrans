@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+make scan-compose FAIL_ON=error

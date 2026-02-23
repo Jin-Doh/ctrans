@@ -1,0 +1,4 @@
+/bin/
+/dist/*.sh
+/dist/*.json
+/coverage.out

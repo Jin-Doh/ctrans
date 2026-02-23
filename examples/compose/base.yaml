@@ -1,0 +1,19 @@
+name: demo
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+
+  app:
+    image: nginx:latest
+    depends_on:
+      - db
+    environment:
+      APP_ENV: dev
+      DB_PASSWORD: should-not-be-committed
+    ports:
+      - "8080:80"
