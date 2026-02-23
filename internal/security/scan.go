@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -12,15 +13,25 @@ import (
 )
 
 var (
-	sensitiveKeyPattern  = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`)
-	privatePathPattern   = regexp.MustCompile(`(?i)(^|/)(id_rsa|id_ed25519|.*\.pem|.*\.key)$`)
+	defaultSensitiveKeyPatternExpr  = `(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`
+	defaultSensitivePathPatternExpr = `(?i)(^|/)(id_rsa|id_ed25519|.*\.pem|.*\.key)$`
+
+	defaultSensitiveKeyPattern = regexp.MustCompile(defaultSensitiveKeyPatternExpr)
+	defaultSensitivePathRegex  = regexp.MustCompile(defaultSensitivePathPatternExpr)
+
 	privateBlockPattern  = regexp.MustCompile(`(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----`)
 	highEntropyLikeValue = regexp.MustCompile(`^[A-Za-z0-9_\-\+/=]{40,}$`)
+	credentialURLPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@`)
 )
 
 // Config controls scan behavior.
 type Config struct {
-	Mask bool
+	Mask                  bool
+	SensitiveKeyPatterns  []string
+	SensitivePathPatterns []string
+	ScanEnvFiles          bool
+	ExtraEnvFiles         []string
+	BaseDir               string
 }
 
 // Report is the output of the scanner.
@@ -32,10 +43,18 @@ type Report struct {
 
 func Scan(project *compose.Project, preFindings []report.Finding, cfg Config) Report {
 	findings := append([]report.Finding{}, preFindings...)
+	keyPattern := compilePattern(cfg.SensitiveKeyPatterns, defaultSensitiveKeyPattern)
+	pathPattern := compilePattern(cfg.SensitivePathPatterns, defaultSensitivePathRegex)
+	scannedEnvFiles := map[string]struct{}{}
+
 	for _, svcName := range project.ServiceNames() {
 		svc := project.Services[svcName]
-		findings = append(findings, scanService(svc, cfg)...)
+		findings = append(findings, scanService(svc, cfg, keyPattern, pathPattern, scannedEnvFiles)...)
 	}
+	if cfg.ScanEnvFiles {
+		findings = append(findings, scanGlobalExtraEnvFiles(cfg, keyPattern, scannedEnvFiles)...)
+	}
+
 	return Report{
 		Files:    append([]string(nil), project.Files...),
 		Findings: findings,
@@ -43,7 +62,13 @@ func Scan(project *compose.Project, preFindings []report.Finding, cfg Config) Re
 	}
 }
 
-func scanService(svc *compose.Service, cfg Config) []report.Finding {
+func scanService(
+	svc *compose.Service,
+	cfg Config,
+	keyPattern *regexp.Regexp,
+	pathPattern *regexp.Regexp,
+	scannedEnvFiles map[string]struct{},
+) []report.Finding {
 	findings := []report.Finding{}
 	keys := make([]string, 0, len(svc.Environment))
 	for key := range svc.Environment {
@@ -53,29 +78,45 @@ func scanService(svc *compose.Service, cfg Config) []report.Finding {
 
 	for _, key := range keys {
 		env := svc.Environment[key]
-		if !sensitiveKeyPattern.MatchString(key) {
-			continue
-		}
 		if !env.HasValue {
 			continue
 		}
 		if looksEnvRef(env.Value) {
 			continue
 		}
+
+		isSensitiveKey := keyPattern.MatchString(key)
+		isSensitiveValue, valueSeverity := ClassifySecretValue(env.Value)
+		if !isSensitiveKey && !isSensitiveValue {
+			continue
+		}
+
 		severity := report.SeverityWarn
-		if privateBlockPattern.MatchString(env.Value) || highEntropyLikeValue.MatchString(env.Value) {
+		if valueSeverity == report.SeverityError {
 			severity = report.SeverityError
 		}
+
+		message := "민감 환경변수 키에 인라인 비밀값이 포함된 것으로 보입니다"
+		if !isSensitiveKey {
+			message = "일반 환경변수 키지만 값이 민감정보로 보입니다"
+		}
+
 		masked := ""
 		if cfg.Mask {
 			masked = MaskValue(env.Value)
 		}
+
+		findingID := "sensitive-env"
+		if !isSensitiveKey {
+			findingID = "sensitive-env-by-value"
+		}
+
 		findings = append(findings, report.Finding{
-			ID:             "sensitive-env",
+			ID:             findingID,
 			Severity:       severity,
 			Service:        svc.Name,
 			Field:          fmt.Sprintf("environment.%s", key),
-			Message:        "민감 환경변수 키에 인라인 비밀값이 포함된 것으로 보입니다",
+			Message:        message,
 			MaskedValue:    masked,
 			Recommendation: "인라인 값 대신 런타임 주입(-e KEY 또는 원격 시크릿 주입)을 사용하세요",
 		})
@@ -87,7 +128,7 @@ func scanService(svc *compose.Service, cfg Config) []report.Finding {
 			continue
 		}
 		base := filepath.Base(host)
-		if privatePathPattern.MatchString(strings.ToLower(base)) || strings.Contains(strings.ToLower(host), "/.ssh/") {
+		if pathPattern.MatchString(strings.ToLower(base)) || strings.Contains(strings.ToLower(host), "/.ssh/") {
 			findings = append(findings, report.Finding{
 				ID:             "sensitive-volume-path",
 				Severity:       report.SeverityError,
@@ -113,9 +154,196 @@ func scanService(svc *compose.Service, cfg Config) []report.Finding {
 				Recommendation: "env_file 이 VCS에 포함되지 않도록 하고 안전한 채널로 배포하세요",
 			})
 		}
+		if cfg.ScanEnvFiles {
+			findings = append(findings, scanEnvFileEntries(envFile, svc.Name, cfg, keyPattern, scannedEnvFiles)...)
+		}
 	}
 
 	return findings
+}
+
+func scanGlobalExtraEnvFiles(cfg Config, keyPattern *regexp.Regexp, scannedEnvFiles map[string]struct{}) []report.Finding {
+	if len(cfg.ExtraEnvFiles) == 0 {
+		return nil
+	}
+	findings := make([]report.Finding, 0)
+	for _, envFile := range uniqueStrings(cfg.ExtraEnvFiles) {
+		findings = append(findings, scanEnvFileEntries(envFile, "global", cfg, keyPattern, scannedEnvFiles)...)
+	}
+	return findings
+}
+
+func scanEnvFileEntries(
+	rawPath string,
+	serviceName string,
+	cfg Config,
+	keyPattern *regexp.Regexp,
+	scannedEnvFiles map[string]struct{},
+) []report.Finding {
+	resolved := resolveEnvFilePath(rawPath, cfg.BaseDir)
+	if _, already := scannedEnvFiles[resolved]; already {
+		return nil
+	}
+	scannedEnvFiles[resolved] = struct{}{}
+
+	payload, err := os.ReadFile(resolved)
+	if err != nil {
+		return []report.Finding{{
+			ID:             "env-file-read-failed",
+			Severity:       report.SeverityWarn,
+			Service:        serviceName,
+			Field:          fmt.Sprintf("env_file.%s", filepath.Base(rawPath)),
+			Message:        "env_file 내용을 읽지 못해 민감값 검사를 건너뜁니다",
+			Recommendation: "env_file 경로를 확인하고 실행 호스트에서 접근 가능한지 점검하세요",
+		}}
+	}
+
+	lines := strings.Split(string(payload), "\n")
+	findings := make([]report.Finding, 0)
+	for idx, line := range lines {
+		key, value, hasValue, ok := parseEnvLine(line)
+		if !ok || !hasValue {
+			continue
+		}
+		if looksEnvRef(value) {
+			continue
+		}
+
+		isSensitiveKey := keyPattern.MatchString(key)
+		isSensitiveValue, valueSeverity := ClassifySecretValue(value)
+		if !isSensitiveKey && !isSensitiveValue {
+			continue
+		}
+
+		severity := report.SeverityWarn
+		if valueSeverity == report.SeverityError {
+			severity = report.SeverityError
+		}
+
+		message := "env_file 내 민감 키의 인라인 값이 감지되었습니다"
+		if !isSensitiveKey {
+			message = "env_file 내 값이 민감정보로 추정됩니다"
+		}
+
+		masked := ""
+		if cfg.Mask {
+			masked = MaskValue(value)
+		}
+
+		findings = append(findings, report.Finding{
+			ID:             "sensitive-env-file-entry",
+			Severity:       severity,
+			Service:        serviceName,
+			Field:          fmt.Sprintf("env_file.%s:%d.%s", filepath.Base(rawPath), idx+1, key),
+			Message:        message,
+			MaskedValue:    masked,
+			Recommendation: "env_file에 비밀값을 직접 저장하지 말고 실행 시점 시크릿 주입을 사용하세요",
+		})
+	}
+	return findings
+}
+
+func parseEnvLine(line string) (key string, value string, hasValue bool, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return "", "", false, false
+	}
+	if strings.HasPrefix(trimmed, "export ") {
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "export "))
+	}
+	k, v, found := strings.Cut(trimmed, "=")
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return "", "", false, false
+	}
+	if !found {
+		return k, "", false, true
+	}
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 {
+		if (strings.HasPrefix(v, "\"") && strings.HasSuffix(v, "\"")) || (strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'")) {
+			v = v[1 : len(v)-1]
+		}
+	}
+	return k, v, true, true
+}
+
+func compilePattern(patterns []string, fallback *regexp.Regexp) *regexp.Regexp {
+	valid := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		if _, err := regexp.Compile(trimmed); err != nil {
+			continue
+		}
+		valid = append(valid, "("+trimmed+")")
+	}
+	if len(valid) == 0 {
+		return fallback
+	}
+	compiled, err := regexp.Compile(strings.Join(valid, "|"))
+	if err != nil {
+		return fallback
+	}
+	return compiled
+}
+
+func resolveEnvFilePath(path string, baseDir string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed)
+	}
+	if strings.TrimSpace(baseDir) == "" {
+		return filepath.Clean(trimmed)
+	}
+	return filepath.Clean(filepath.Join(baseDir, trimmed))
+}
+
+func uniqueStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ClassifySecretValue classifies whether a value likely contains sensitive material.
+func ClassifySecretValue(value string) (bool, report.Severity) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false, report.SeverityWarn
+	}
+	if looksEnvRef(trimmed) {
+		return false, report.SeverityWarn
+	}
+	if privateBlockPattern.MatchString(trimmed) {
+		return true, report.SeverityError
+	}
+	if credentialURLPattern.MatchString(trimmed) {
+		return true, report.SeverityError
+	}
+	if highEntropyLikeValue.MatchString(trimmed) {
+		return true, report.SeverityError
+	}
+	return false, report.SeverityWarn
 }
 
 func hostPath(volume string) string {
