@@ -23,5 +23,11 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Compose scan smoke
+        run: make scan-compose COMPOSE_FILES="examples/compose/base.yaml" FAIL_ON=none WARNINGS=off
+
+      - name: Compose verify smoke
+        run: make verify-compose COMPOSE_FILES="examples/compose/base.yaml" FAIL_ON=none WARNINGS=off
+
       - name: Enforce coverage gate (>=90%)
         run: make coverage-gate THRESHOLD=90

@@ -6,20 +6,25 @@ ENV_FILES ?=
 FAIL_ON ?= error
 MASK ?= on
 WARNINGS ?= on
+POLICY ?= configs/policy.default.yaml
+ALLOW_INLINE_SENSITIVE ?= off
 PROJECT_NAME ?=
 STRICT ?=
 OUT_DIR ?= dist
 HOST ?=
 SSH_OPTS ?=
+SSH_BASE_OPTS ?= -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR
 THRESHOLD ?= 90
 COVER_PROFILE ?= coverage.out
 
 compose_flags = $(foreach f,$(COMPOSE_FILES),-f $(f))
 env_flags = $(foreach f,$(ENV_FILES),--env $(f))
+policy_flag = $(if $(POLICY),--policy $(POLICY),)
+allow_inline_flag = --allow-inline-sensitive $(ALLOW_INLINE_SENSITIVE)
 project_flag = $(if $(PROJECT_NAME),--project-name $(PROJECT_NAME),)
 strict_flag = $(if $(STRICT),--strict,)
 
-.PHONY: help build test coverage coverage-gate scan-compose render-run verify-compose deploy-plan deploy-ssh hooks-install
+.PHONY: help build test coverage coverage-gate scan-compose render-run verify-compose deploy-plan deploy-ssh deploy-ssh-safe hooks-install
 
 help:
 	@echo "ctrans Make 도움말"
@@ -54,6 +59,7 @@ help:
 	@echo "  verify-compose : 스캔+변환 검증을 수행합니다."
 	@echo "  deploy-plan    : 배포 계획 JSON(dist/deploy-plan.json)을 생성합니다."
 	@echo "  deploy-ssh     : 생성된 deploy.sh를 SSH 원격 호스트에서 실행합니다."
+	@echo "  deploy-ssh-safe: deploy.sh 해시 검증 후 SSH 원격 호스트에서 실행합니다."
 	@echo "  hooks-install  : git hooks(pre-commit, pre-push)를 설치합니다."
 	@echo ""
 	@echo "자주 쓰는 옵션:"
@@ -63,10 +69,13 @@ help:
 	@echo "  FAIL_ON=none|warn|error         : 실패 임계치 (기본: error)"
 	@echo "  MASK=on|off                     : 민감값 마스킹 여부 (기본: on)"
 	@echo "  WARNINGS=on|off                 : 경고 상세 출력 여부 (JSON 파싱용 off 권장)"
+	@echo "  POLICY=configs/policy.default.yaml : 정책 YAML 경로"
+	@echo "  ALLOW_INLINE_SENSITIVE=on|off   : 민감 인라인 env 허용 여부 (기본: off)"
 	@echo "  PROJECT_NAME=demo               : 컨테이너 이름 prefix"
 	@echo "  STRICT=1                        : verify 시 warn을 error로 승격"
 	@echo "  HOST=user@server                : deploy-ssh 대상 호스트"
 	@echo "  SSH_OPTS=\"-p 2222\"             : ssh 추가 옵션"
+	@echo "  SSH_BASE_OPTS=\"...\"            : ssh 기본 보안 옵션 (기본: BatchMode+HostKeyChecking)"
 	@echo "  THRESHOLD=90                    : coverage-gate 기준 퍼센트"
 	@echo "  COVER_PROFILE=coverage.out      : 커버리지 프로파일 경로"
 	@echo ""
@@ -76,6 +85,7 @@ help:
 	@echo "  make verify-compose COMPOSE_FILES=\"examples/compose/base.yaml\" FAIL_ON=warn STRICT=1"
 	@echo "  make deploy-plan COMPOSE_FILES=\"examples/compose/base.yaml\" WARNINGS=off FAIL_ON=none"
 	@echo "  make deploy-ssh HOST=user@server COMPOSE_FILES=\"examples/compose/base.yaml\""
+	@echo "  make deploy-ssh-safe HOST=user@server COMPOSE_FILES=\"examples/compose/base.yaml\""
 
 build:
 	$(GO_ENV) go build -o ./bin/ctrans ./cmd/ctrans
@@ -94,22 +104,28 @@ coverage-gate: coverage
 	( echo "coverage gate failed: $$total% < $(THRESHOLD)%"; exit 1 )
 
 scan-compose:
-	$(GO_ENV) $(CTRANS) scan $(compose_flags) $(env_flags) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS)
+	$(GO_ENV) $(CTRANS) scan $(compose_flags) $(env_flags) $(policy_flag) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(allow_inline_flag)
 
 render-run:
 	mkdir -p $(OUT_DIR)
-	$(GO_ENV) $(CTRANS) render $(compose_flags) $(env_flags) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(project_flag) --output script --out $(OUT_DIR)/deploy.sh
+	$(GO_ENV) $(CTRANS) render $(compose_flags) $(env_flags) $(policy_flag) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(allow_inline_flag) $(project_flag) --output script --out $(OUT_DIR)/deploy.sh
 
 verify-compose:
-	$(GO_ENV) $(CTRANS) verify $(compose_flags) $(env_flags) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(project_flag) $(strict_flag)
+	$(GO_ENV) $(CTRANS) verify $(compose_flags) $(env_flags) $(policy_flag) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(allow_inline_flag) $(project_flag) $(strict_flag)
 
 deploy-plan:
 	mkdir -p $(OUT_DIR)
-	$(GO_ENV) $(CTRANS) deploy-plan $(compose_flags) $(env_flags) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(project_flag) --out $(OUT_DIR)/deploy-plan.json
+	$(GO_ENV) $(CTRANS) deploy-plan $(compose_flags) $(env_flags) $(policy_flag) --runtime $(RUNTIME) --fail-on $(FAIL_ON) --mask $(MASK) --warnings $(WARNINGS) $(allow_inline_flag) $(project_flag) --out $(OUT_DIR)/deploy-plan.json
 
 deploy-ssh: render-run
 	@test -n "$(HOST)" || (echo "HOST is required. e.g. make deploy-ssh HOST=user@server" && exit 1)
-	cat $(OUT_DIR)/deploy.sh | ssh $(SSH_OPTS) $(HOST) 'bash -s'
+	cat $(OUT_DIR)/deploy.sh | ssh $(SSH_BASE_OPTS) $(SSH_OPTS) $(HOST) 'bash -s'
+
+deploy-ssh-safe: render-run
+	@test -n "$(HOST)" || (echo "HOST is required. e.g. make deploy-ssh-safe HOST=user@server" && exit 1)
+	@sha=`shasum -a 256 $(OUT_DIR)/deploy.sh | awk '{print $$1}'`; \
+	echo "deploy.sh sha256=$$sha"; \
+	ssh $(SSH_BASE_OPTS) $(SSH_OPTS) $(HOST) "set -euo pipefail; trap 'rm -f /tmp/ctrans-deploy.sh' EXIT; umask 077; cat > /tmp/ctrans-deploy.sh && (command -v sha256sum >/dev/null 2>&1 && echo '$$sha  /tmp/ctrans-deploy.sh' | sha256sum -c - || echo '$$sha  /tmp/ctrans-deploy.sh' | shasum -a 256 -c -) && bash /tmp/ctrans-deploy.sh" < $(OUT_DIR)/deploy.sh
 
 hooks-install:
 	@test -d .git || (echo "Not a git repository (.git missing)" && exit 1)

@@ -79,6 +79,53 @@ func TestRenderService_FullFlagsAndWarnings(t *testing.T) {
 	}
 }
 
+func TestRenderService_AllowInlineSensitive(t *testing.T) {
+	svc := &compose.Service{
+		Name:  "app",
+		Image: "nginx",
+		Environment: map[string]compose.EnvValue{
+			"TOKEN": {Value: "super-secret-token", HasValue: true},
+		},
+	}
+
+	cmd, warnings, err := renderService("docker", "demo", svc, Options{AllowInlineSensitive: true})
+	if err != nil {
+		t.Fatalf("renderService returned error: %v", err)
+	}
+	if !strings.Contains(cmd, "TOKEN=super-secret-token") {
+		t.Fatalf("expected inline sensitive env to be rendered when explicitly allowed, got %s", cmd)
+	}
+	if len(warnings) != 1 || warnings[0].ID != "sensitive-env-inline-allowed" {
+		t.Fatalf("expected inline-allowed warning, got %+v", warnings)
+	}
+}
+
+func TestRenderService_CustomSensitivePattern(t *testing.T) {
+	svc := &compose.Service{
+		Name:  "app",
+		Image: "nginx",
+		Environment: map[string]compose.EnvValue{
+			"CUSTOM_CRED": {Value: "plain", HasValue: true},
+		},
+	}
+
+	cmd, warnings, err := renderService("docker", "demo", svc, Options{
+		SensitiveKeyPatterns: []string{`(?i)custom_cred`},
+	})
+	if err != nil {
+		t.Fatalf("renderService returned error: %v", err)
+	}
+	if strings.Contains(cmd, "CUSTOM_CRED=plain") {
+		t.Fatalf("expected custom sensitive key to be redacted, got %s", cmd)
+	}
+	if !strings.Contains(cmd, "-e CUSTOM_CRED") {
+		t.Fatalf("expected runtime injection placeholder for custom sensitive key, got %s", cmd)
+	}
+	if len(warnings) != 1 || warnings[0].ID != "sensitive-env-redacted" {
+		t.Fatalf("expected sensitive-env-redacted warning, got %+v", warnings)
+	}
+}
+
 func TestRenderService_ErrorAndHelpers(t *testing.T) {
 	if _, _, err := renderService("docker", "demo", &compose.Service{Name: "x"}, Options{}); err == nil {
 		t.Fatalf("expected missing image error")
@@ -109,5 +156,17 @@ func TestTopologicalOrder_MissingDependencyWarning(t *testing.T) {
 	}
 	if len(warnings) == 0 || warnings[0].ID != "missing-dependency" {
 		t.Fatalf("expected missing dependency warning, got %+v", warnings)
+	}
+}
+
+func TestCompileSensitiveKeyPattern(t *testing.T) {
+	pat := compileSensitiveKeyPattern([]string{`[`})
+	if !pat.MatchString("DB_PASSWORD") {
+		t.Fatalf("invalid custom pattern should fall back to default sensitive key pattern")
+	}
+
+	pat = compileSensitiveKeyPattern([]string{`(?i)custom_cred`})
+	if !pat.MatchString("CUSTOM_CRED") {
+		t.Fatalf("expected custom pattern to match")
 	}
 }

@@ -7,6 +7,7 @@ runtime:
 secrets:
   mask: true
   fail_on: error
+  scan_env_files: true
   sensitive_key_patterns:
     - '(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)'
   sensitive_path_patterns:

@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"compose_to_run/internal/compose"
+	"compose_to_run/internal/policy"
 	"compose_to_run/internal/report"
 	"compose_to_run/internal/security"
 	"compose_to_run/internal/transform"
@@ -27,13 +29,15 @@ func (m *multiFlag) Set(value string) error {
 }
 
 type commonFlags struct {
-	files       multiFlag
-	envFiles    multiFlag
-	runtime     string
-	projectName string
-	mask        string
-	failOn      string
-	warnings    string
+	files                multiFlag
+	envFiles             multiFlag
+	runtime              string
+	projectName          string
+	mask                 string
+	failOn               string
+	warnings             string
+	policyPath           string
+	allowInlineSensitive string
 }
 
 type decision struct {
@@ -86,10 +90,14 @@ func runScan(args []string) error {
 	format := fs.String("format", "text", "출력 형식: text|json")
 	registerCommonFlags(fs, &common)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, err := loadAndScan(common)
+	project, findings, _, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
@@ -137,20 +145,26 @@ func runRender(args []string) error {
 	outPath := fs.String("out", "", "선택 출력 파일 경로")
 	registerCommonFlags(fs, &common)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
 	showWarnings := parseWarnings(common.warnings)
 
 	plan, err := transform.BuildPlan(project, transform.Options{
-		Runtime:       common.runtime,
-		ProjectName:   common.projectName,
-		Mask:          parseMask(common.mask),
-		ExtraEnvFiles: common.envFiles,
+		Runtime:              common.runtime,
+		ProjectName:          common.projectName,
+		Mask:                 parseMask(common.mask),
+		ExtraEnvFiles:        common.envFiles,
+		SensitiveKeyPatterns: policyCfg.Secrets.SensitiveKeyPatterns,
+		AllowInlineSensitive: parseAllowInlineSensitive(common.allowInlineSensitive),
 	})
 	if err != nil {
 		return err
@@ -216,19 +230,25 @@ func runVerify(args []string) error {
 	strict := fs.Bool("strict", false, "경고를 오류로 승격")
 	registerCommonFlags(fs, &common)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
 	showWarnings := parseWarnings(common.warnings)
 	plan, err := transform.BuildPlan(project, transform.Options{
-		Runtime:       common.runtime,
-		ProjectName:   common.projectName,
-		Mask:          parseMask(common.mask),
-		ExtraEnvFiles: common.envFiles,
+		Runtime:              common.runtime,
+		ProjectName:          common.projectName,
+		Mask:                 parseMask(common.mask),
+		ExtraEnvFiles:        common.envFiles,
+		SensitiveKeyPatterns: policyCfg.Secrets.SensitiveKeyPatterns,
+		AllowInlineSensitive: parseAllowInlineSensitive(common.allowInlineSensitive),
 	})
 	if err != nil {
 		return err
@@ -254,21 +274,27 @@ func runDeployPlan(args []string) error {
 	outPath := fs.String("out", "", "선택 출력 파일 경로")
 	registerCommonFlags(fs, &common)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
 	showWarnings := parseWarnings(common.warnings)
 
 	plan, err := transform.BuildPlan(project, transform.Options{
-		Runtime:        common.runtime,
-		ProjectName:    common.projectName,
-		Mask:           parseMask(common.mask),
-		TargetServices: splitCSV(*targetService),
-		ExtraEnvFiles:  common.envFiles,
+		Runtime:              common.runtime,
+		ProjectName:          common.projectName,
+		Mask:                 parseMask(common.mask),
+		TargetServices:       splitCSV(*targetService),
+		ExtraEnvFiles:        common.envFiles,
+		SensitiveKeyPatterns: policyCfg.Secrets.SensitiveKeyPatterns,
+		AllowInlineSensitive: parseAllowInlineSensitive(common.allowInlineSensitive),
 	})
 	if err != nil {
 		return err
@@ -311,32 +337,93 @@ func runDeployPlan(args []string) error {
 }
 
 func registerCommonFlags(fs *flag.FlagSet, common *commonFlags) {
-	common.runtime = "docker"
-	common.mask = "on"
-	common.failOn = "error"
+	defaultPolicy := policy.Default()
+	common.runtime = defaultPolicy.Runtime.Default
+	if defaultPolicy.Secrets.Mask {
+		common.mask = "on"
+	} else {
+		common.mask = "off"
+	}
+	common.failOn = defaultPolicy.Secrets.FailOn
 	common.warnings = "on"
+	common.policyPath = policy.DefaultPath
+	common.allowInlineSensitive = "off"
 	fs.Var(&common.files, "f", "compose 파일 경로 (반복 가능, 지정 순서로 병합)")
 	fs.Var(&common.files, "file", "compose 파일 경로 (반복 가능, 지정 순서로 병합)")
 	fs.Var(&common.envFiles, "env", "추가 env-file 경로 (반복 가능)")
-	fs.StringVar(&common.runtime, "runtime", "docker", "런타임: docker|podman")
+	fs.StringVar(&common.runtime, "runtime", common.runtime, "런타임: docker|podman")
 	fs.StringVar(&common.projectName, "project-name", "", "컨테이너 이름 prefix용 프로젝트 이름")
-	fs.StringVar(&common.mask, "mask", "on", "민감값 마스킹: on|off")
-	fs.StringVar(&common.failOn, "fail-on", "error", "실패 임계치: none|warn|error")
+	fs.StringVar(&common.mask, "mask", common.mask, "민감값 마스킹: on|off")
+	fs.StringVar(&common.failOn, "fail-on", common.failOn, "실패 임계치: none|warn|error")
 	fs.StringVar(&common.warnings, "warnings", "on", "경고 상세 출력: on|off")
+	fs.StringVar(&common.policyPath, "policy", common.policyPath, "정책 파일 경로 (기본: configs/policy.default.yaml)")
+	fs.StringVar(&common.allowInlineSensitive, "allow-inline-sensitive", common.allowInlineSensitive, "민감 인라인 env 허용: on|off (기본: off)")
 }
 
-func loadAndScan(common commonFlags) (*compose.Project, []report.Finding, error) {
+func loadAndScan(common *commonFlags, visited map[string]bool) (*compose.Project, []report.Finding, policy.Config, error) {
+	if common == nil {
+		return nil, nil, policy.Config{}, fmt.Errorf("common flags is nil")
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve cwd: %w", err)
+		return nil, nil, policy.Config{}, fmt.Errorf("resolve cwd: %w", err)
 	}
-	project, loadWarnings, err := compose.Load(common.files, cwd)
+	policyCfg, policyWarnings, err := loadPolicy(cwd, common.policyPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, policy.Config{}, err
 	}
+	applyPolicyDefaults(common, policyCfg, visited)
+	project, loadWarnings, err := compose.LoadWithOptions(common.files, cwd, compose.LoadOptions{
+		Resolve: compose.ResolveOptions{
+			DefaultCandidates: policyCfg.Compose.DefaultCandidates,
+			DefaultCollision:  policyCfg.Compose.DefaultCollision,
+		},
+	})
+	if err != nil {
+		return nil, nil, policy.Config{}, err
+	}
+	preFindings := append([]report.Finding{}, loadWarnings...)
+	preFindings = append(preFindings, policyWarnings...)
 
-	scan := security.Scan(project, loadWarnings, security.Config{Mask: parseMask(common.mask)})
-	return project, scan.Findings, nil
+	scan := security.Scan(project, preFindings, security.Config{
+		Mask:                  parseMask(common.mask),
+		SensitiveKeyPatterns:  policyCfg.Secrets.SensitiveKeyPatterns,
+		SensitivePathPatterns: policyCfg.Secrets.SensitivePathPatterns,
+		ScanEnvFiles:          policyCfg.Secrets.ScanEnvFiles,
+		ExtraEnvFiles:         common.envFiles,
+		BaseDir:               cwd,
+	})
+	return project, scan.Findings, policyCfg, nil
+}
+
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
+	})
+	return seen
+}
+
+func applyPolicyDefaults(common *commonFlags, cfg policy.Config, visited map[string]bool) {
+	if common == nil {
+		return
+	}
+	if !visited["runtime"] {
+		common.runtime = cfg.Runtime.Default
+	}
+	if !visited["fail-on"] {
+		common.failOn = cfg.Secrets.FailOn
+	}
+	if !visited["mask"] {
+		common.mask = boolToOnOff(cfg.Secrets.Mask)
+	}
+}
+
+func boolToOnOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func parseMask(mask string) bool {
@@ -354,6 +441,15 @@ func parseWarnings(raw string) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+func parseAllowInlineSensitive(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "true", "1", "yes":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -437,6 +533,7 @@ func printRootUsage() {
 	fmt.Fprintln(os.Stderr, "usage: ctrans <scan|render|verify|deploy-plan> [options]")
 	fmt.Fprintln(os.Stderr, "       ctrans [render options]   # 서브커맨드 생략 시 render 기본 동작")
 	fmt.Fprintln(os.Stderr, "공통 옵션: -f <file>(반복 가능), --runtime docker|podman, --fail-on none|warn|error, --warnings on|off")
+	fmt.Fprintln(os.Stderr, "추가 옵션: --policy <yaml>, --allow-inline-sensitive on|off")
 	fmt.Fprintln(os.Stderr, "결과 값: final_status(ok|warn|blocked), can_proceed(true|false)")
 	fmt.Fprintln(os.Stderr, "fail-on 정책: none=차단 없음, error=오류 시 차단, warn=경고/오류 시 차단")
 	fmt.Fprintln(os.Stderr, "")
@@ -449,7 +546,39 @@ func printRootUsage() {
 	fmt.Fprintln(os.Stderr, "실무 예시:")
 	fmt.Fprintln(os.Stderr, "  ctrans render -f compose.yaml")
 	fmt.Fprintln(os.Stderr, "  ctrans scan -f compose.yaml --format json --warnings off --fail-on none")
+	fmt.Fprintln(os.Stderr, "  ctrans render -f compose.yaml --allow-inline-sensitive off --policy configs/policy.default.yaml")
 	fmt.Fprintln(os.Stderr, "  ctrans deploy-plan -f compose.yaml --target-service app --warnings off --fail-on none")
+}
+
+func loadPolicy(cwd, policyPath string) (policy.Config, []report.Finding, error) {
+	path := strings.TrimSpace(policyPath)
+	if path == "" {
+		path = policy.DefaultPath
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cwd, path)
+	}
+
+	cfg, err := policy.Load(path)
+	if err == nil {
+		return cfg, nil, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return policy.Config{}, nil, err
+	}
+
+	msg := fmt.Sprintf("policy 파일을 찾을 수 없어 내장 기본값을 사용합니다: %s", path)
+	warnings := []report.Finding{}
+	if strings.TrimSpace(policyPath) != "" && strings.TrimSpace(policyPath) != policy.DefaultPath {
+		warnings = append(warnings, report.Finding{
+			ID:             "policy-file-missing",
+			Severity:       report.SeverityWarn,
+			Field:          "policy",
+			Message:        msg,
+			Recommendation: "지정한 --policy 경로를 확인하세요",
+		})
+	}
+	return policy.Default(), warnings, nil
 }
 
 func isRootHelp(arg string) bool {

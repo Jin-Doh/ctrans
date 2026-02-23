@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"compose_to_run/internal/policy"
 	"compose_to_run/internal/report"
 	"compose_to_run/internal/transform"
 )
@@ -37,6 +38,9 @@ func TestMultiFlagAndHelpers(t *testing.T) {
 	}
 	if parseWarnings("weird") != true {
 		t.Fatalf("unexpected default parseWarnings behavior")
+	}
+	if !parseAllowInlineSensitive("on") || !parseAllowInlineSensitive("true") || parseAllowInlineSensitive("off") {
+		t.Fatalf("unexpected parseAllowInlineSensitive behavior")
 	}
 
 	csv := splitCSV("a, b,,c")
@@ -283,6 +287,53 @@ services:
 	})
 }
 
+func TestRunRender_AppliesPolicyDefaultsWhenFlagsOmitted(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yaml")
+	policyPath := filepath.Join(dir, "custom-policy.yaml")
+	mustWrite(t, composePath, `services:
+  app:
+    image: nginx
+    environment:
+      DB_PASSWORD: plain
+`)
+	mustWrite(t, policyPath, `runtime:
+  default: podman
+  supported: [docker, podman]
+secrets:
+  mask: false
+  fail_on: warn
+  sensitive_key_patterns:
+    - '(?i)(password|secret|token)'
+  sensitive_path_patterns:
+    - '(?i)(.*\\.pem)$'
+  scan_env_files: true
+compose:
+  default_candidates:
+    - compose.yaml
+  default_collision: prefer_docker_compose_yaml
+`)
+
+	withDir(t, dir, func() {
+		// policy fail_on=warn should block without explicit --fail-on override
+		if err := runRender([]string{"--policy", filepath.Base(policyPath)}); err == nil {
+			t.Fatalf("runRender should fail by policy default fail_on=warn")
+		}
+
+		out := filepath.Join(dir, "deploy.sh")
+		if err := runRender([]string{"--policy", filepath.Base(policyPath), "--fail-on", "none", "--out", out}); err != nil {
+			t.Fatalf("runRender should succeed with explicit fail-on override: %v", err)
+		}
+		script, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("read render script: %v", err)
+		}
+		if !strings.Contains(string(script), "podman run") {
+			t.Fatalf("expected policy default runtime podman to be applied, got %s", string(script))
+		}
+	})
+}
+
 func TestRunDeployPlan(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "compose.yaml")
@@ -341,7 +392,8 @@ func TestLoadAndScanAndRegisterFlags(t *testing.T) {
 `)
 
 	withDir(t, dir, func() {
-		project, findings, err := loadAndScan(commonFlags{files: multiFlag{"compose.yaml"}, mask: "on"})
+		cf := commonFlags{files: multiFlag{"compose.yaml"}, mask: "on"}
+		project, findings, _, err := loadAndScan(&cf, map[string]bool{})
 		if err != nil {
 			t.Fatalf("loadAndScan should succeed: %v", err)
 		}
@@ -353,11 +405,82 @@ func TestLoadAndScanAndRegisterFlags(t *testing.T) {
 	var cf commonFlags
 	fs := flagSetForTest()
 	registerCommonFlags(fs, &cf)
-	if err := fs.Parse([]string{"-f", "a.yaml", "--env", ".env", "--runtime", "podman", "--project-name", "demo", "--mask", "off", "--warnings", "off", "--fail-on", "warn"}); err != nil {
+	if err := fs.Parse([]string{"-f", "a.yaml", "--env", ".env", "--runtime", "podman", "--project-name", "demo", "--mask", "off", "--warnings", "off", "--fail-on", "warn", "--policy", "custom-policy.yaml", "--allow-inline-sensitive", "on"}); err != nil {
 		t.Fatalf("flag parse failed: %v", err)
 	}
-	if len(cf.files) != 1 || len(cf.envFiles) != 1 || cf.runtime != "podman" || cf.projectName != "demo" || cf.mask != "off" || cf.warnings != "off" || cf.failOn != "warn" {
+	if len(cf.files) != 1 || len(cf.envFiles) != 1 || cf.runtime != "podman" || cf.projectName != "demo" || cf.mask != "off" || cf.warnings != "off" || cf.failOn != "warn" || cf.policyPath != "custom-policy.yaml" || cf.allowInlineSensitive != "on" {
 		t.Fatalf("unexpected common flags parse: %+v", cf)
+	}
+}
+
+func TestLoadPolicyFallbackAndExplicitWarning(t *testing.T) {
+	dir := t.TempDir()
+
+	cfg, warnings, err := loadPolicy(dir, "")
+	if err != nil {
+		t.Fatalf("loadPolicy fallback should not fail: %v", err)
+	}
+	if cfg.Runtime.Default == "" {
+		t.Fatalf("expected fallback default policy")
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("implicit default path missing should not emit warning, got %+v", warnings)
+	}
+
+	cfg, warnings, err = loadPolicy(dir, "custom.yaml")
+	if err != nil {
+		t.Fatalf("loadPolicy explicit missing should fallback with warning: %v", err)
+	}
+	if cfg.Runtime.Default == "" || len(warnings) != 1 || warnings[0].ID != "policy-file-missing" {
+		t.Fatalf("unexpected explicit missing policy result: cfg=%+v warnings=%+v", cfg, warnings)
+	}
+
+	invalid := filepath.Join(dir, "invalid.yaml")
+	mustWrite(t, invalid, "runtime: [")
+	if _, _, err := loadPolicy(dir, invalid); err == nil {
+		t.Fatalf("invalid policy yaml should return error")
+	}
+}
+
+func TestApplyPolicyDefaults(t *testing.T) {
+	common := commonFlags{
+		runtime: "docker",
+		failOn:  "error",
+		mask:    "on",
+	}
+	cfg := policy.Default()
+	cfg.Runtime.Default = "podman"
+	cfg.Secrets.FailOn = "warn"
+	cfg.Secrets.Mask = false
+
+	applyPolicyDefaults(&common, cfg, map[string]bool{})
+	if common.runtime != "podman" || common.failOn != "warn" || common.mask != "off" {
+		t.Fatalf("policy defaults should apply for unvisited flags, got %+v", common)
+	}
+
+	common = commonFlags{
+		runtime: "docker",
+		failOn:  "error",
+		mask:    "on",
+	}
+	applyPolicyDefaults(&common, cfg, map[string]bool{"runtime": true, "fail-on": true, "mask": true})
+	if common.runtime != "docker" || common.failOn != "error" || common.mask != "on" {
+		t.Fatalf("visited flags must not be overridden by policy defaults, got %+v", common)
+	}
+}
+
+func TestSubcommandHelpReturnsNil(t *testing.T) {
+	if err := runScan([]string{"--help"}); err != nil {
+		t.Fatalf("runScan --help should not fail: %v", err)
+	}
+	if err := runRender([]string{"--help"}); err != nil {
+		t.Fatalf("runRender --help should not fail: %v", err)
+	}
+	if err := runVerify([]string{"--help"}); err != nil {
+		t.Fatalf("runVerify --help should not fail: %v", err)
+	}
+	if err := runDeployPlan([]string{"--help"}); err != nil {
+		t.Fatalf("runDeployPlan --help should not fail: %v", err)
 	}
 }
 
@@ -444,6 +567,8 @@ func TestMainEntrypoints(t *testing.T) {
 		{name: "no args", args: nil, wantCode: 2, wantInOut: "usage: ctrans"},
 		{name: "help", args: []string{"help"}, wantCode: 0, wantInOut: "usage: ctrans"},
 		{name: "help flag", args: []string{"--help"}, wantCode: 0, wantInOut: "usage: ctrans"},
+		{name: "render help", args: []string{"render", "--help"}, wantCode: 0, wantInOut: "Usage of render:"},
+		{name: "scan help", args: []string{"scan", "--help"}, wantCode: 0, wantInOut: "Usage of scan:"},
 		{name: "unknown", args: []string{"unknown"}, wantCode: 1, wantInOut: "알 수 없는 서브커맨드"},
 		{name: "scan ok", args: []string{"scan", "--fail-on", "none"}, wantCode: 0, wantInOut: "summary:"},
 		{name: "implicit render from flags", args: []string{"-f", "compose.yaml", "--fail-on", "none"}, wantCode: 0, wantInOut: "#!/usr/bin/env bash"},

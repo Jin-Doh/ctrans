@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  decide-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push' && github.event.workflow_run.repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      prerelease: ${{ steps.decide.outputs.prerelease }}
+      commit_type: ${{ steps.decide.outputs.commit_type }}
+      reason: ${{ steps.decide.outputs.reason }}
+      target_sha: ${{ steps.decide.outputs.target_sha }}
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Decide release
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          first_line="$(git log -1 --pretty=%s)"
+
+          commit_type=""
+          if [[ "$first_line" =~ ^([a-z]+)(\([^)]+\))?(!)?:[[:space:]].+ ]]; then
+            commit_type="${BASH_REMATCH[1]}"
+          fi
+
+          should_release=false
+          reason="커밋 메시지가 릴리스 대상 타입이 아닙니다"
+          case "$commit_type" in
+            feat|fix|perf|refactor)
+              should_release=true
+              reason="릴리스 대상 커밋 타입입니다"
+              ;;
+          esac
+
+          if [[ ! -f VERSION ]]; then
+            echo "VERSION 파일이 없습니다." >&2
+            exit 1
+          fi
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ -z "$version" ]]; then
+            echo "VERSION 파일이 비어 있습니다." >&2
+            exit 1
+          fi
+
+          semver_regex='^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if [[ ! "$version" =~ $semver_regex ]]; then
+            echo "VERSION 형식이 올바르지 않습니다: $version" >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          prerelease=false
+          if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            prerelease=true
+          fi
+
+          git fetch --tags --force
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            should_release=false
+            reason="동일 태그($tag)가 이미 존재하여 릴리스를 건너뜁니다. VERSION을 갱신하세요"
+          fi
+
+          {
+            echo "should_release=$should_release"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+            echo "commit_type=$commit_type"
+            echo "reason=$reason"
+            echo "target_sha=${{ github.event.workflow_run.head_sha }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decision summary
+        run: |
+          echo "should_release=${{ steps.decide.outputs.should_release }}"
+          echo "version=${{ steps.decide.outputs.version }}"
+          echo "tag=${{ steps.decide.outputs.tag }}"
+          echo "prerelease=${{ steps.decide.outputs.prerelease }}"
+          echo "commit_type=${{ steps.decide.outputs.commit_type }}"
+          echo "reason=${{ steps.decide.outputs.reason }}"
+          echo "target_sha=${{ steps.decide.outputs.target_sha }}"
+
+  build-artifacts:
+    needs:
+      - decide-release
+    if: needs.decide-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.decide-release.outputs.target_sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ needs.decide-release.outputs.version }}'
+          goos='${{ matrix.goos }}'
+          goarch='${{ matrix.goarch }}'
+
+          mkdir -p dist
+
+          binary_path="dist/ctrans_${goos}_${goarch}"
+          CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -o "$binary_path" ./cmd/ctrans
+
+          archive_root="ctrans_${version}_${goos}_${goarch}"
+          mkdir -p "dist/${archive_root}"
+          cp "$binary_path" "dist/${archive_root}/ctrans"
+          cp LICENSE "dist/${archive_root}/LICENSE"
+          cp README.md "dist/${archive_root}/README.md"
+
+          tar -C dist -czf "dist/${archive_root}.tar.gz" "${archive_root}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctrans-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/ctrans_${{ needs.decide-release.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs:
+      - decide-release
+      - build-artifacts
+    if: needs.decide-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/ctrans_*.tar.gz)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "릴리스 아티팩트를 찾지 못했습니다." >&2
+            exit 1
+          fi
+
+          checksum_file="dist/ctrans_${{ needs.decide-release.outputs.version }}_checksums.txt"
+          sha256sum "${files[@]}" | sed 's|  dist/|  |' > "$checksum_file"
+          cat "$checksum_file"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.decide-release.outputs.tag }}
+          name: ctrans ${{ needs.decide-release.outputs.tag }}
+          target_commitish: ${{ needs.decide-release.outputs.target_sha }}
+          generate_release_notes: true
+          prerelease: ${{ needs.decide-release.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.decide-release.outputs.prerelease != 'true' }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            자동 생성 릴리스입니다.
+            - trigger workflow: CI (success)
+            - version source: VERSION
+            - commit type: ${{ needs.decide-release.outputs.commit_type }}
+            - trigger commit: ${{ needs.decide-release.outputs.target_sha }}
+          files: |
+            dist/ctrans_*.tar.gz
+            dist/ctrans_${{ needs.decide-release.outputs.version }}_checksums.txt
+
+  skip-release:
+    if: ${{ github.event.workflow_run.conclusion != 'success' || github.event.workflow_run.head_branch != 'main' || github.event.workflow_run.event != 'push' || github.event.workflow_run.repository.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip reason
+        run: echo "release skipped: only successful push-based CI runs on main can publish releases"

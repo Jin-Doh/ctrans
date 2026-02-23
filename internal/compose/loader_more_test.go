@@ -144,3 +144,89 @@ func TestParseFile_ReadError(t *testing.T) {
 		t.Fatalf("expected read error")
 	}
 }
+
+func TestResolveInputFilesWithOptions_DefaultCandidates(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "custom-compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	files, warnings, err := ResolveInputFilesWithOptions(nil, dir, ResolveOptions{
+		DefaultCandidates: []string{"custom-compose.yaml", "compose.yaml"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveInputFilesWithOptions returned error: %v", err)
+	}
+	if len(files) != 1 || filepath.Base(files[0]) != "custom-compose.yaml" {
+		t.Fatalf("expected custom-compose.yaml, got %v", files)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %+v", warnings)
+	}
+}
+
+func TestLoadWithOptions_UsesCustomDefaults(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "custom.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	project, warnings, err := LoadWithOptions(nil, dir, LoadOptions{
+		Resolve: ResolveOptions{DefaultCandidates: []string{"custom.yaml"}},
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOptions returned error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %+v", warnings)
+	}
+	if _, ok := project.Services["app"]; !ok {
+		t.Fatalf("expected app service loaded from custom default candidates")
+	}
+}
+
+func TestResolveInputFilesWithOptions_DefaultCollisionPolicy(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "compose.yaml"), "services:\n  app:\n    image: nginx:stable\n")
+	mustWriteFile(t, filepath.Join(dir, "docker-compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	files, warnings, err := ResolveInputFilesWithOptions(nil, dir, ResolveOptions{
+		DefaultCandidates: []string{"compose.yaml", "docker-compose.yaml"},
+		DefaultCollision:  "prefer_docker_compose_yaml",
+	})
+	if err != nil {
+		t.Fatalf("ResolveInputFilesWithOptions returned error: %v", err)
+	}
+	if len(files) != 1 || filepath.Base(files[0]) != "docker-compose.yaml" {
+		t.Fatalf("expected docker-compose.yaml by collision policy, got %v", files)
+	}
+	if len(warnings) != 1 || warnings[0].ID != "default-compose-collision" {
+		t.Fatalf("expected default-compose-collision warning, got %+v", warnings)
+	}
+}
+
+func TestLoad_SetsServiceSourceAndEnvFileBase(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub dir: %v", err)
+	}
+	path := filepath.Join(sub, "compose.yaml")
+	mustWriteFile(t, path, `services:
+  app:
+    image: nginx
+    env_file:
+      - .env
+`)
+
+	project, warnings, err := Load([]string{path}, dir)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("expected no warnings, got %+v", warnings)
+	}
+	app := project.Services["app"]
+	if app.SourceFile != path {
+		t.Fatalf("expected source file tracked, got %q", app.SourceFile)
+	}
+	if app.EnvFilesBase != sub {
+		t.Fatalf("expected env file base dir %q, got %q", sub, app.EnvFilesBase)
+	}
+}

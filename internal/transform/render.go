@@ -8,18 +8,21 @@ import (
 
 	"compose_to_run/internal/compose"
 	"compose_to_run/internal/report"
+	"compose_to_run/internal/secrules"
 	"compose_to_run/internal/security"
 )
 
-var sensitiveKeyPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`)
+var defaultSensitiveKeyPattern = regexp.MustCompile(secrules.DefaultSensitiveKeyPatternExpr)
 
 // Options controls rendering behavior.
 type Options struct {
-	Runtime        string
-	ProjectName    string
-	Mask           bool
-	TargetServices []string
-	ExtraEnvFiles  []string
+	Runtime              string
+	ProjectName          string
+	Mask                 bool
+	TargetServices       []string
+	ExtraEnvFiles        []string
+	SensitiveKeyPatterns []string
+	AllowInlineSensitive bool
 }
 
 // ServicePlan describes one rendered runtime command.
@@ -109,6 +112,7 @@ func renderService(runtime, projectName string, svc *compose.Service, opts Optio
 		envKeys = append(envKeys, key)
 	}
 	sort.Strings(envKeys)
+	sensitiveKeyPattern := compileSensitiveKeyPattern(opts.SensitiveKeyPatterns)
 
 	for _, key := range envKeys {
 		env := svc.Environment[key]
@@ -124,20 +128,35 @@ func renderService(runtime, projectName string, svc *compose.Service, opts Optio
 			})
 			continue
 		}
-		if env.HasValue && sensitiveKeyPattern.MatchString(key) && !looksEnvRef(env.Value) {
-			args = append(args, "-e", key)
-			warnings = append(warnings, report.Finding{
-				ID:             "sensitive-env-redacted",
-				Severity:       report.SeverityWarn,
-				Service:        svc.Name,
-				Field:          fmt.Sprintf("environment.%s", key),
-				Message:        "민감한 인라인 환경변수 값은 렌더된 커맨드에서 생략되었습니다",
-				MaskedValue:    security.MaskValue(env.Value),
-				Recommendation: "이 값은 SSH/세션 환경변수로 런타임 주입하세요",
-			})
-			continue
-		}
 		if env.HasValue {
+			isSensitiveKey := sensitiveKeyPattern.MatchString(key)
+			isSensitiveValue, _ := security.ClassifySecretValue(env.Value)
+			if isSensitiveKey || isSensitiveValue {
+				if opts.AllowInlineSensitive {
+					args = append(args, "-e", fmt.Sprintf("%s=%s", key, env.Value))
+					warnings = append(warnings, report.Finding{
+						ID:             "sensitive-env-inline-allowed",
+						Severity:       report.SeverityWarn,
+						Service:        svc.Name,
+						Field:          fmt.Sprintf("environment.%s", key),
+						Message:        "민감 가능성이 있는 인라인 환경변수가 허용 모드로 렌더되었습니다",
+						MaskedValue:    security.MaskValue(env.Value),
+						Recommendation: "운영 환경에서는 --allow-inline-sensitive off(기본값)을 유지하세요",
+					})
+					continue
+				}
+				args = append(args, "-e", key)
+				warnings = append(warnings, report.Finding{
+					ID:             "sensitive-env-redacted",
+					Severity:       report.SeverityWarn,
+					Service:        svc.Name,
+					Field:          fmt.Sprintf("environment.%s", key),
+					Message:        "민감 가능성이 있는 인라인 환경변수 값은 렌더된 커맨드에서 생략되었습니다",
+					MaskedValue:    security.MaskValue(env.Value),
+					Recommendation: "이 값은 SSH/세션 환경변수로 런타임 주입하세요",
+				})
+				continue
+			}
 			args = append(args, "-e", fmt.Sprintf("%s=%s", key, env.Value))
 			continue
 		}
@@ -213,6 +232,10 @@ func shellQuote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func compileSensitiveKeyPattern(patterns []string) *regexp.Regexp {
+	return secrules.CompilePattern(patterns, defaultSensitiveKeyPattern)
 }
 
 func selectServices(project *compose.Project, targets []string) (map[string]bool, error) {
