@@ -24,6 +24,7 @@ metadata:
 
 - 서브커맨드 생략 시 기본 동작은 `render`다.
 - 기본 정책은 `--fail-on error`다.
+- 기본 정책 파일은 `configs/policy.default.yaml`이며, 필요 시 `--policy <path>`로 교체한다.
 - 결과 판단 값은 항상 `final_status`, `can_proceed`, `recommended_action`, `fail_threshold`를 기준으로 해석한다.
 
 ## 표준 실행 절차
@@ -31,19 +32,19 @@ metadata:
 1. JSON 점검(파이프라인 친화)
 
 ```bash
-/usr/local/bin/ctrans scan -f <compose-file> --format json --warnings off --fail-on none
+/usr/local/bin/ctrans scan -f <compose-file> --format json --warnings off --fail-on none --policy configs/policy.default.yaml
 ```
 
 2. 실행 스크립트 생성
 
 ```bash
-/usr/local/bin/ctrans render -f <compose-file> --output script --fail-on none
+/usr/local/bin/ctrans render -f <compose-file> --output script --fail-on none --allow-inline-sensitive off --policy configs/policy.default.yaml
 ```
 
 3. 배포 계획(JSON) 생성
 
 ```bash
-/usr/local/bin/ctrans deploy-plan -f <compose-file> --warnings off --fail-on none
+/usr/local/bin/ctrans deploy-plan -f <compose-file> --warnings off --fail-on none --policy configs/policy.default.yaml
 ```
 
 4. 엄격 검증(차단 게이트)
