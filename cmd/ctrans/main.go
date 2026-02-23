@@ -95,8 +95,9 @@ func runScan(args []string) error {
 		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, _, err := loadAndScan(common)
+	project, findings, _, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
@@ -149,8 +150,9 @@ func runRender(args []string) error {
 		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, policyCfg, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
@@ -233,8 +235,9 @@ func runVerify(args []string) error {
 		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, policyCfg, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
@@ -276,8 +279,9 @@ func runDeployPlan(args []string) error {
 		}
 		return err
 	}
+	visited := visitedFlags(fs)
 
-	project, findings, policyCfg, err := loadAndScan(common)
+	project, findings, policyCfg, err := loadAndScan(&common, visited)
 	if err != nil {
 		return err
 	}
@@ -356,7 +360,10 @@ func registerCommonFlags(fs *flag.FlagSet, common *commonFlags) {
 	fs.StringVar(&common.allowInlineSensitive, "allow-inline-sensitive", common.allowInlineSensitive, "민감 인라인 env 허용: on|off (기본: off)")
 }
 
-func loadAndScan(common commonFlags) (*compose.Project, []report.Finding, policy.Config, error) {
+func loadAndScan(common *commonFlags, visited map[string]bool) (*compose.Project, []report.Finding, policy.Config, error) {
+	if common == nil {
+		return nil, nil, policy.Config{}, fmt.Errorf("common flags is nil")
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, nil, policy.Config{}, fmt.Errorf("resolve cwd: %w", err)
@@ -365,9 +372,11 @@ func loadAndScan(common commonFlags) (*compose.Project, []report.Finding, policy
 	if err != nil {
 		return nil, nil, policy.Config{}, err
 	}
+	applyPolicyDefaults(common, policyCfg, visited)
 	project, loadWarnings, err := compose.LoadWithOptions(common.files, cwd, compose.LoadOptions{
 		Resolve: compose.ResolveOptions{
 			DefaultCandidates: policyCfg.Compose.DefaultCandidates,
+			DefaultCollision:  policyCfg.Compose.DefaultCollision,
 		},
 	})
 	if err != nil {
@@ -385,6 +394,36 @@ func loadAndScan(common commonFlags) (*compose.Project, []report.Finding, policy
 		BaseDir:               cwd,
 	})
 	return project, scan.Findings, policyCfg, nil
+}
+
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
+	})
+	return seen
+}
+
+func applyPolicyDefaults(common *commonFlags, cfg policy.Config, visited map[string]bool) {
+	if common == nil {
+		return
+	}
+	if !visited["runtime"] {
+		common.runtime = cfg.Runtime.Default
+	}
+	if !visited["fail-on"] {
+		common.failOn = cfg.Secrets.FailOn
+	}
+	if !visited["mask"] {
+		common.mask = boolToOnOff(cfg.Secrets.Mask)
+	}
+}
+
+func boolToOnOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func parseMask(mask string) bool {

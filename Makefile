@@ -125,7 +125,7 @@ deploy-ssh-safe: render-run
 	@test -n "$(HOST)" || (echo "HOST is required. e.g. make deploy-ssh-safe HOST=user@server" && exit 1)
 	@sha=`shasum -a 256 $(OUT_DIR)/deploy.sh | awk '{print $$1}'`; \
 	echo "deploy.sh sha256=$$sha"; \
-	ssh $(SSH_BASE_OPTS) $(SSH_OPTS) $(HOST) "cat > /tmp/ctrans-deploy.sh && (command -v sha256sum >/dev/null 2>&1 && echo '$$sha  /tmp/ctrans-deploy.sh' | sha256sum -c - || echo '$$sha  /tmp/ctrans-deploy.sh' | shasum -a 256 -c -) && bash /tmp/ctrans-deploy.sh" < $(OUT_DIR)/deploy.sh
+	ssh $(SSH_BASE_OPTS) $(SSH_OPTS) $(HOST) "set -euo pipefail; trap 'rm -f /tmp/ctrans-deploy.sh' EXIT; umask 077; cat > /tmp/ctrans-deploy.sh && (command -v sha256sum >/dev/null 2>&1 && echo '$$sha  /tmp/ctrans-deploy.sh' | sha256sum -c - || echo '$$sha  /tmp/ctrans-deploy.sh' | shasum -a 256 -c -) && bash /tmp/ctrans-deploy.sh" < $(OUT_DIR)/deploy.sh
 
 hooks-install:
 	@test -d .git || (echo "Not a git repository (.git missing)" && exit 1)

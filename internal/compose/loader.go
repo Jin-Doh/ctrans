@@ -42,6 +42,7 @@ var (
 // ResolveOptions controls default compose file discovery behavior.
 type ResolveOptions struct {
 	DefaultCandidates []string
+	DefaultCollision  string
 }
 
 // LoadOptions controls compose loading behavior.
@@ -139,15 +140,32 @@ func ResolveInputFilesWithOptions(inputFiles []string, cwd string, opts ResolveO
 		return existing, warnings, nil
 	default:
 		preferred := existing[0]
+		switch strings.TrimSpace(opts.DefaultCollision) {
+		case "", "prefer_docker_compose_yaml":
+			for _, path := range existing {
+				if filepath.Base(path) == "docker-compose.yaml" {
+					preferred = path
+					break
+				}
+			}
+		}
 		warnings = append(warnings, report.Finding{
 			ID:             "default-compose-collision",
 			Severity:       report.SeverityWarn,
 			Field:          "file",
-			Message:        fmt.Sprintf("%s 파일들이 모두 존재하여 첫 번째 발견 후보(%s)를 우선 사용합니다", strings.Join(candidates, ", "), filepath.Base(preferred)),
+			Message:        fmt.Sprintf("%s 파일들이 모두 존재하여 충돌 정책(%s) 기준으로 %s를 우선 사용합니다", strings.Join(candidates, ", "), defaultCollisionName(opts.DefaultCollision), filepath.Base(preferred)),
 			Recommendation: "중복 후보 파일을 정리하거나 -f 순서를 명시해서 병합 순서를 제어하세요",
 		})
 		return []string{preferred}, warnings, nil
 	}
+}
+
+func defaultCollisionName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "prefer_docker_compose_yaml"
+	}
+	return trimmed
 }
 
 func parseFile(path string) (*Project, []report.Finding, error) {
@@ -192,7 +210,7 @@ func parseFile(path string) (*Project, []report.Finding, error) {
 		if !ok {
 			return nil, warnings, fmt.Errorf("%s 의 service %q 는 객체 형태여야 합니다", path, svcName)
 		}
-		svc, svcWarnings := parseService(svcName, svcMap)
+		svc, svcWarnings := parseService(svcName, svcMap, path)
 		warnings = append(warnings, svcWarnings...)
 		project.Services[svcName] = svc
 	}
@@ -219,10 +237,12 @@ func parseFile(path string) (*Project, []report.Finding, error) {
 	return project, warnings, nil
 }
 
-func parseService(name string, in map[string]any) (*Service, []report.Finding) {
+func parseService(name string, in map[string]any, sourcePath string) (*Service, []report.Finding) {
 	svc := &Service{
-		Name:        name,
-		Environment: map[string]EnvValue{},
+		Name:         name,
+		SourceFile:   sourcePath,
+		Environment:  map[string]EnvValue{},
+		EnvFilesBase: filepath.Dir(sourcePath),
 	}
 	warnings := []report.Finding{}
 

@@ -10,14 +10,12 @@ import (
 
 	"compose_to_run/internal/compose"
 	"compose_to_run/internal/report"
+	"compose_to_run/internal/secrules"
 )
 
 var (
-	defaultSensitiveKeyPatternExpr  = `(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`
-	defaultSensitivePathPatternExpr = `(?i)(^|/)(id_rsa|id_ed25519|.*\.pem|.*\.key)$`
-
-	defaultSensitiveKeyPattern = regexp.MustCompile(defaultSensitiveKeyPatternExpr)
-	defaultSensitivePathRegex  = regexp.MustCompile(defaultSensitivePathPatternExpr)
+	defaultSensitiveKeyPattern = regexp.MustCompile(secrules.DefaultSensitiveKeyPatternExpr)
+	defaultSensitivePathRegex  = regexp.MustCompile(secrules.DefaultSensitivePathPatternExpr)
 
 	privateBlockPattern  = regexp.MustCompile(`(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----`)
 	highEntropyLikeValue = regexp.MustCompile(`^[A-Za-z0-9_\-\+/=]{40,}$`)
@@ -155,7 +153,7 @@ func scanService(
 			})
 		}
 		if cfg.ScanEnvFiles {
-			findings = append(findings, scanEnvFileEntries(envFile, svc.Name, cfg, keyPattern, scannedEnvFiles)...)
+			findings = append(findings, scanEnvFileEntries(envFile, svc.Name, cfg, keyPattern, scannedEnvFiles, envFileBaseDir(svc, cfg))...)
 		}
 	}
 
@@ -168,7 +166,7 @@ func scanGlobalExtraEnvFiles(cfg Config, keyPattern *regexp.Regexp, scannedEnvFi
 	}
 	findings := make([]report.Finding, 0)
 	for _, envFile := range uniqueStrings(cfg.ExtraEnvFiles) {
-		findings = append(findings, scanEnvFileEntries(envFile, "global", cfg, keyPattern, scannedEnvFiles)...)
+		findings = append(findings, scanEnvFileEntries(envFile, "global", cfg, keyPattern, scannedEnvFiles, cfg.BaseDir)...)
 	}
 	return findings
 }
@@ -179,14 +177,25 @@ func scanEnvFileEntries(
 	cfg Config,
 	keyPattern *regexp.Regexp,
 	scannedEnvFiles map[string]struct{},
+	baseDir string,
 ) []report.Finding {
-	resolved := resolveEnvFilePath(rawPath, cfg.BaseDir)
+	resolved := resolveEnvFilePath(rawPath, baseDir)
+	fallbackResolved := resolveEnvFilePath(rawPath, cfg.BaseDir)
 	if _, already := scannedEnvFiles[resolved]; already {
 		return nil
 	}
 	scannedEnvFiles[resolved] = struct{}{}
 
 	payload, err := os.ReadFile(resolved)
+	if err != nil && fallbackResolved != "" && fallbackResolved != resolved {
+		if _, already := scannedEnvFiles[fallbackResolved]; !already {
+			if fallbackPayload, fallbackErr := os.ReadFile(fallbackResolved); fallbackErr == nil {
+				payload = fallbackPayload
+				err = nil
+				scannedEnvFiles[fallbackResolved] = struct{}{}
+			}
+		}
+	}
 	if err != nil {
 		return []report.Finding{{
 			ID:             "env-file-read-failed",
@@ -243,6 +252,19 @@ func scanEnvFileEntries(
 	return findings
 }
 
+func envFileBaseDir(svc *compose.Service, cfg Config) string {
+	if svc == nil {
+		return cfg.BaseDir
+	}
+	if strings.TrimSpace(svc.EnvFilesBase) != "" {
+		return svc.EnvFilesBase
+	}
+	if strings.TrimSpace(svc.SourceFile) != "" {
+		return filepath.Dir(svc.SourceFile)
+	}
+	return cfg.BaseDir
+}
+
 func parseEnvLine(line string) (key string, value string, hasValue bool, ok bool) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -269,25 +291,7 @@ func parseEnvLine(line string) (key string, value string, hasValue bool, ok bool
 }
 
 func compilePattern(patterns []string, fallback *regexp.Regexp) *regexp.Regexp {
-	valid := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		trimmed := strings.TrimSpace(p)
-		if trimmed == "" {
-			continue
-		}
-		if _, err := regexp.Compile(trimmed); err != nil {
-			continue
-		}
-		valid = append(valid, "("+trimmed+")")
-	}
-	if len(valid) == 0 {
-		return fallback
-	}
-	compiled, err := regexp.Compile(strings.Join(valid, "|"))
-	if err != nil {
-		return fallback
-	}
-	return compiled
+	return secrules.CompilePattern(patterns, fallback)
 }
 
 func resolveEnvFilePath(path string, baseDir string) string {

@@ -111,9 +111,10 @@ func TestScan_EnvFileContentAndGlobalEnvFiles(t *testing.T) {
 	project := compose.NewProject()
 	project.Files = []string{"compose.yaml"}
 	project.Services["svc"] = &compose.Service{
-		Name:     "svc",
-		Image:    "alpine",
-		EnvFiles: []string{filepath.Base(serviceEnv)},
+		Name:         "svc",
+		Image:        "alpine",
+		EnvFiles:     []string{filepath.Base(serviceEnv)},
+		EnvFilesBase: dir,
 	}
 
 	rep := Scan(project, nil, Config{
@@ -133,6 +134,45 @@ func TestScan_EnvFileContentAndGlobalEnvFiles(t *testing.T) {
 	}
 	if entryCount < 2 {
 		t.Fatalf("expected at least two sensitive env file findings, got %+v", rep.Findings)
+	}
+}
+
+func TestScan_EnvFileUsesServiceBaseDir(t *testing.T) {
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir sub dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, ".env"), []byte("DB_URL=postgres://user:pass@db.local:5432/app\n"), 0o644); err != nil {
+		t.Fatalf("write service .env file: %v", err)
+	}
+
+	project := compose.NewProject()
+	project.Files = []string{filepath.Join(subDir, "compose.yaml")}
+	project.Services["svc"] = &compose.Service{
+		Name:         "svc",
+		Image:        "alpine",
+		EnvFiles:     []string{".env"},
+		EnvFilesBase: subDir,
+	}
+
+	rep := Scan(project, nil, Config{
+		Mask:         true,
+		ScanEnvFiles: true,
+		BaseDir:      dir,
+	})
+
+	found := false
+	for _, f := range rep.Findings {
+		if f.ID == "sensitive-env-file-entry" {
+			found = true
+		}
+		if f.ID == "env-file-read-failed" {
+			t.Fatalf("should read env_file from service base dir, got %+v", f)
+		}
+	}
+	if !found {
+		t.Fatalf("expected sensitive finding from service base env_file, got %+v", rep.Findings)
 	}
 }
 

@@ -34,10 +34,12 @@ type Service struct {
 	Name          string
 	Image         string
 	ContainerName string
+	SourceFile    string
 	Command       CommandSpec
 	Entrypoint    CommandSpec
 	Environment   map[string]EnvValue
 	EnvFiles      []string
+	EnvFilesBase  string
 	Ports         []string
 	Volumes       []string
 	WorkingDir    string
@@ -55,8 +57,10 @@ func (s *Service) Clone() *Service {
 		Name:          s.Name,
 		Image:         s.Image,
 		ContainerName: s.ContainerName,
+		SourceFile:    s.SourceFile,
 		Command:       s.Command.Clone(),
 		Entrypoint:    s.Entrypoint.Clone(),
+		EnvFilesBase:  s.EnvFilesBase,
 		WorkingDir:    s.WorkingDir,
 		Restart:       s.Restart,
 	}
@@ -144,6 +148,9 @@ func mergeService(base, override *Service) {
 	if override.ContainerName != "" {
 		base.ContainerName = override.ContainerName
 	}
+	if override.SourceFile != "" {
+		base.SourceFile = override.SourceFile
+	}
 	if override.Command.IsSet() {
 		base.Command = override.Command.Clone()
 	}
@@ -160,6 +167,7 @@ func mergeService(base, override *Service) {
 	}
 	if len(override.EnvFiles) > 0 {
 		base.EnvFiles = append([]string(nil), override.EnvFiles...)
+		base.EnvFilesBase = override.EnvFilesBase
 	}
 	if len(override.Ports) > 0 {
 		base.Ports = append([]string(nil), override.Ports...)

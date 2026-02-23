@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"compose_to_run/internal/policy"
 	"compose_to_run/internal/report"
 	"compose_to_run/internal/transform"
 )
@@ -286,6 +287,53 @@ services:
 	})
 }
 
+func TestRunRender_AppliesPolicyDefaultsWhenFlagsOmitted(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yaml")
+	policyPath := filepath.Join(dir, "custom-policy.yaml")
+	mustWrite(t, composePath, `services:
+  app:
+    image: nginx
+    environment:
+      DB_PASSWORD: plain
+`)
+	mustWrite(t, policyPath, `runtime:
+  default: podman
+  supported: [docker, podman]
+secrets:
+  mask: false
+  fail_on: warn
+  sensitive_key_patterns:
+    - '(?i)(password|secret|token)'
+  sensitive_path_patterns:
+    - '(?i)(.*\\.pem)$'
+  scan_env_files: true
+compose:
+  default_candidates:
+    - compose.yaml
+  default_collision: prefer_docker_compose_yaml
+`)
+
+	withDir(t, dir, func() {
+		// policy fail_on=warn should block without explicit --fail-on override
+		if err := runRender([]string{"--policy", filepath.Base(policyPath)}); err == nil {
+			t.Fatalf("runRender should fail by policy default fail_on=warn")
+		}
+
+		out := filepath.Join(dir, "deploy.sh")
+		if err := runRender([]string{"--policy", filepath.Base(policyPath), "--fail-on", "none", "--out", out}); err != nil {
+			t.Fatalf("runRender should succeed with explicit fail-on override: %v", err)
+		}
+		script, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("read render script: %v", err)
+		}
+		if !strings.Contains(string(script), "podman run") {
+			t.Fatalf("expected policy default runtime podman to be applied, got %s", string(script))
+		}
+	})
+}
+
 func TestRunDeployPlan(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "compose.yaml")
@@ -344,7 +392,8 @@ func TestLoadAndScanAndRegisterFlags(t *testing.T) {
 `)
 
 	withDir(t, dir, func() {
-		project, findings, _, err := loadAndScan(commonFlags{files: multiFlag{"compose.yaml"}, mask: "on"})
+		cf := commonFlags{files: multiFlag{"compose.yaml"}, mask: "on"}
+		project, findings, _, err := loadAndScan(&cf, map[string]bool{})
 		if err != nil {
 			t.Fatalf("loadAndScan should succeed: %v", err)
 		}
@@ -390,6 +439,33 @@ func TestLoadPolicyFallbackAndExplicitWarning(t *testing.T) {
 	mustWrite(t, invalid, "runtime: [")
 	if _, _, err := loadPolicy(dir, invalid); err == nil {
 		t.Fatalf("invalid policy yaml should return error")
+	}
+}
+
+func TestApplyPolicyDefaults(t *testing.T) {
+	common := commonFlags{
+		runtime: "docker",
+		failOn:  "error",
+		mask:    "on",
+	}
+	cfg := policy.Default()
+	cfg.Runtime.Default = "podman"
+	cfg.Secrets.FailOn = "warn"
+	cfg.Secrets.Mask = false
+
+	applyPolicyDefaults(&common, cfg, map[string]bool{})
+	if common.runtime != "podman" || common.failOn != "warn" || common.mask != "off" {
+		t.Fatalf("policy defaults should apply for unvisited flags, got %+v", common)
+	}
+
+	common = commonFlags{
+		runtime: "docker",
+		failOn:  "error",
+		mask:    "on",
+	}
+	applyPolicyDefaults(&common, cfg, map[string]bool{"runtime": true, "fail-on": true, "mask": true})
+	if common.runtime != "docker" || common.failOn != "error" || common.mask != "on" {
+		t.Fatalf("visited flags must not be overridden by policy defaults, got %+v", common)
 	}
 }
 

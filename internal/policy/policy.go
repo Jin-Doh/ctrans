@@ -6,13 +6,12 @@ import (
 	"regexp"
 	"strings"
 
+	"compose_to_run/internal/secrules"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	DefaultPath                     = "configs/policy.default.yaml"
-	defaultSensitiveKeyPatternExpr  = `(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`
-	defaultSensitivePathPatternExpr = `(?i)(^|/)(id_rsa|id_ed25519|.*\\.pem|.*\\.key)$`
+	DefaultPath = "configs/policy.default.yaml"
 )
 
 // Config describes runtime/scan/compose policy inputs.
@@ -67,8 +66,8 @@ func Default() Config {
 		Secrets: SecretsConfig{
 			Mask:                  true,
 			FailOn:                "error",
-			SensitiveKeyPatterns:  []string{defaultSensitiveKeyPatternExpr},
-			SensitivePathPatterns: []string{defaultSensitivePathPatternExpr},
+			SensitiveKeyPatterns:  []string{secrules.DefaultSensitiveKeyPatternExpr},
+			SensitivePathPatterns: []string{secrules.DefaultSensitivePathPatternExpr},
 			ScanEnvFiles:          true,
 		},
 		Compose: ComposeConfig{

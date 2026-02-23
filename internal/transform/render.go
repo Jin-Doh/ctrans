@@ -8,10 +8,11 @@ import (
 
 	"compose_to_run/internal/compose"
 	"compose_to_run/internal/report"
+	"compose_to_run/internal/secrules"
 	"compose_to_run/internal/security"
 )
 
-var defaultSensitiveKeyPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key)`)
+var defaultSensitiveKeyPattern = regexp.MustCompile(secrules.DefaultSensitiveKeyPatternExpr)
 
 // Options controls rendering behavior.
 type Options struct {
@@ -234,25 +235,7 @@ func shellQuote(s string) string {
 }
 
 func compileSensitiveKeyPattern(patterns []string) *regexp.Regexp {
-	valid := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		trimmed := strings.TrimSpace(p)
-		if trimmed == "" {
-			continue
-		}
-		if _, err := regexp.Compile(trimmed); err != nil {
-			continue
-		}
-		valid = append(valid, "("+trimmed+")")
-	}
-	if len(valid) == 0 {
-		return defaultSensitiveKeyPattern
-	}
-	compiled, err := regexp.Compile(strings.Join(valid, "|"))
-	if err != nil {
-		return defaultSensitiveKeyPattern
-	}
-	return compiled
+	return secrules.CompilePattern(patterns, defaultSensitiveKeyPattern)
 }
 
 func selectServices(project *compose.Project, targets []string) (map[string]bool, error) {

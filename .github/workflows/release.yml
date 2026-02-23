@@ -66,14 +66,15 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          semver_regex='^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if [[ ! "$version" =~ $semver_regex ]]; then
             echo "VERSION 형식이 올바르지 않습니다: $version" >&2
             exit 1
           fi
 
           tag="v${version}"
           prerelease=false
-          if [[ "$version" == *-* ]]; then
+          if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
             prerelease=true
           fi
 
